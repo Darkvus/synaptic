@@ -1,463 +1,501 @@
 """
 tui.py — Interactive TUI for synaptic using Textual.
 
-Layout:
-  ┌─────────────────────────────────────────────────────────┐
-  │  synaptic — dependency graph                  v0.1.0    │
-  ├──────────────┬──────────────────────────────────────────┤
-  │              │                                          │
-  │  Node List   │           Graph Canvas                   │
-  │  (sidebar)   │      (Unicode art, navigable)            │
-  │              │                                          │
-  ├──────────────┴──────────────────────────────────────────┤
-  │  Detail panel — selected node info                      │
-  ├─────────────────────────────────────────────────────────┤
-  │  [q] quit  [tab/↑↓] navigate  [f] filter  [r] reset    │
-  └─────────────────────────────────────────────────────────┘
+Design: ego-graph explorer
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  ⬡ synaptic  project · 237 nodes · 643 edges                   │
+  ├─────────────┬───────────────────────────────────────────────────┤
+  │             │  ← imported by          imports →                 │
+  │  All nodes  │                                                   │
+  │  (sidebar)  │   predecessor1 ──╮                               │
+  │             │   predecessor2 ──┤──▶ [ SELECTED NODE ] ──┬──▶  s1│
+  │  ● internal │   predecessor3 ──╯                        ├──▶  s2│
+  │  ◈ AWS                                                  ╰──▶  s3│
+  │  ◈ HTTP     │                                                   │
+  ├─────────────┴───────────────────────────────────────────────────┤
+  │  kind · in: N · out: N · ⚠ circular                             │
+  └─────────────────────────────────────────────────────────────────┘
 """
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Any
 
 import networkx as nx
+from rich.align import Align
+from rich.box import ROUNDED, SIMPLE, MINIMAL
+from rich.columns import Columns
+from rich.console import Group
+from rich.padding import Padding
+from rich.panel import Panel
+from rich.rule import Rule
 from rich.style import Style
+from rich.table import Table
 from rich.text import Text
-from textual import events
+from textual import events, on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Vertical
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widget import Widget
-from textual.widgets import Footer, Header, Label, ListItem, ListView, Static
+from textual.widgets import Footer, Input, Label, Static
 
-# ─── Color palette ──────────────────────────────────────────────────────────
+# ─── Palette ─────────────────────────────────────────────────────────────────
 
-NODE_COLORS: dict[str, str] = {
+KIND_COLOR: dict[str, str] = {
     "internal": "#4F8EF7",
-    "external": "#A0A0A0",
-    "stdlib": "#555577",
-    "AWS": "#FF9900",
-    "GCP": "#4285F4",
-    "Azure": "#0089D6",
-    "http": "#E84393",
+    "external": "#888899",
+    "stdlib":   "#444466",
+    "AWS":      "#FF9900",
+    "GCP":      "#4285F4",
+    "Azure":    "#0089D6",
+    "http":     "#E84393",
 }
 
 KIND_ICON: dict[str, str] = {
     "internal": "◉",
     "external": "○",
-    "stdlib": "·",
-    "AWS": "◈",
-    "GCP": "◈",
-    "Azure": "◈",
-    "http": "◈",
+    "stdlib":   "·",
+    "AWS":      "◈",
+    "GCP":      "◈",
+    "Azure":    "◈",
+    "http":     "◈",
 }
 
-EDGE_STYLES: dict[str, tuple[str, str]] = {
-    "import": ("·", "#2a2a55"),
-    "cloud": ("·", "#7a4400"),
-    "http": ("·", "#6a1040"),
-    "circular": ("·", "#aa1111"),
+KIND_LABEL: dict[str, str] = {
+    "internal": "Internal",
+    "AWS":      "AWS SDK",
+    "GCP":      "GCP SDK",
+    "Azure":    "Azure SDK",
+    "http":     "HTTP client",
+    "external": "External pkg",
+    "stdlib":   "Stdlib",
 }
 
 
-# ─── Graph Canvas ────────────────────────────────────────────────────────────
+# ─── Messages ────────────────────────────────────────────────────────────────
+
+class NodeSelected(Message):
+    def __init__(self, node: str) -> None:
+        super().__init__()
+        self.node = node
 
 
-class GraphCanvas(Widget, can_focus=True):
-    """Renders the dependency graph as a Unicode canvas."""
+# ─── Sidebar ─────────────────────────────────────────────────────────────────
 
-    COMPONENT_CLASSES = {"graph-canvas--selected"}
+class NodeSidebar(Widget, can_focus=False):
+    DEFAULT_CSS = """
+    NodeSidebar {
+        width: 28;
+        background: #08081a;
+        border-right: solid #1e1e3a;
+        overflow-y: scroll;
+    }
+    NodeSidebar Input {
+        background: #111128;
+        border: solid #2a2a4a;
+        color: #a0a0cc;
+        margin: 0 1;
+        height: 3;
+    }
+    NodeSidebar Input:focus {
+        border: solid #4F8EF7;
+    }
+    NodeSidebar .node-row {
+        padding: 0 2;
+        height: 1;
+        color: #888899;
+    }
+    NodeSidebar .node-row:hover {
+        background: #14143a;
+        color: white;
+    }
+    NodeSidebar .node-row.--selected {
+        background: #0d2060;
+        color: white;
+    }
+    NodeSidebar .section-header {
+        padding: 0 1;
+        height: 1;
+        color: #444466;
+        background: #0a0a1e;
+    }
+    """
+
+    filter_text: reactive[str] = reactive("")
+    selected_node: reactive[str | None] = reactive(None)
+
+    def __init__(self, graph: nx.DiGraph, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.graph = graph
+        self._all_nodes: list[tuple[str, dict[str, Any]]] = sorted(
+            graph.nodes(data=True), key=lambda x: (x[1].get("kind", "z"), x[0])
+        )
+
+    def compose(self) -> ComposeResult:
+        yield Input(placeholder="🔍 filter nodes…", id="search-input")
+        yield Label(
+            f" {self.graph.number_of_nodes()} nodes · {self.graph.number_of_edges()} edges",
+            classes="section-header",
+        )
+        self._render_list()
+
+    def _render_list(self) -> None:
+        """Mount node rows, grouped by kind."""
+        # Remove existing rows
+        for w in self.query(".node-row,.section-header.kind-header"):
+            w.remove()
+
+        q = self.filter_text.lower()
+        current_kind: str | None = None
+
+        for node, data in self._all_nodes:
+            label = data.get("label", node.split(".")[-1])
+            if q and q not in node.lower() and q not in label.lower():
+                continue
+
+            kind = data.get("kind", "internal")
+            if kind != current_kind:
+                current_kind = kind
+                color = KIND_COLOR.get(kind, "#888")
+                icon = KIND_ICON.get(kind, "·")
+                kind_lbl = KIND_LABEL.get(kind, kind)
+                self.mount(
+                    Label(
+                        Text.assemble((f" {icon} {kind_lbl}", f"bold {color}")),
+                        classes="section-header kind-header",
+                    )
+                )
+
+            color = KIND_COLOR.get(kind, "#888")
+            icon = KIND_ICON.get(kind, "·")
+            is_sel = node == self.selected_node
+
+            row = Static(
+                Text.assemble(
+                    (f"  {icon} ", f"{'bold ' if is_sel else ''}{color}"),
+                    (label[:20], f"{'bold white' if is_sel else color}"),
+                ),
+                classes=f"node-row{'  --selected' if is_sel else ''}",
+            )
+            row._node_id = node  # type: ignore[attr-defined]
+            self.mount(row)
+
+    def watch_filter_text(self, _: str) -> None:
+        self._render_list()
+
+    def watch_selected_node(self, _: str | None) -> None:
+        self._render_list()
+
+    @on(Input.Changed, "#search-input")
+    def on_search(self, event: Input.Changed) -> None:
+        self.filter_text = event.value
+
+    def on_click(self, event: events.Click) -> None:
+        for child in self.query(".node-row"):
+            node_id = getattr(child, "_node_id", None)
+            if node_id and child.region.contains(event.screen_x, event.screen_y):
+                self.post_message(NodeSelected(node_id))
+                break
+
+
+# ─── Ego graph canvas ─────────────────────────────────────────────────────────
+
+class EgoCanvas(Widget, can_focus=True):
+    """
+    3-column ego graph view:
+
+      predecessors  │  center node  │  successors
+      (imported by) │               │  (imports)
+    """
 
     DEFAULT_CSS = """
-    GraphCanvas {
+    EgoCanvas {
         background: #09091a;
-        border: solid #1e1e3a;
         height: 1fr;
-        padding: 0;
+        padding: 1 2;
     }
-    GraphCanvas:focus {
-        border: solid #4F8EF7;
+    EgoCanvas:focus {
+        border: solid #4F8EF7 25%;
     }
     """
 
     selected_node: reactive[str | None] = reactive(None, layout=True)
 
+    _MAX_NEIGHBORS = 18   # max per side before truncating
+
     def __init__(self, graph: nx.DiGraph, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.graph = graph
-        self._raw_layout: dict[str, tuple[float, float]] = {}
-        self._compute_layout()
-        # ordered list for keyboard navigation
         self._node_order: list[str] = list(graph.nodes())
 
-    def _compute_layout(self) -> None:
-        if not self.graph.nodes:
-            return
-        raw: dict[str, Any] = nx.spring_layout(
-            self.graph, k=2.5, iterations=80, seed=42
+    def render(self) -> Any:
+        if self.selected_node is None:
+            return self._render_welcome()
+        return self._render_ego(self.selected_node)
+
+    def _render_welcome(self) -> Panel:
+        t = Text(justify="center")
+        t.append("\n\n\n")
+        t.append("⬡ synaptic\n\n", style="bold #4F8EF7")
+        t.append("Press ", style="dim")
+        t.append("Tab", style="bold cyan")
+        t.append(" or ", style="dim")
+        t.append("click a node", style="bold cyan")
+        t.append(" in the sidebar\n", style="dim")
+        t.append("to explore its dependency graph", style="dim")
+        return Panel(Align.center(t, vertical="middle"), border_style="#1e1e3a", box=ROUNDED)
+
+    def _render_ego(self, node: str) -> Any:
+        data = self.graph.nodes.get(node, {})
+        kind = data.get("kind", "internal")
+        color = KIND_COLOR.get(kind, "#cccccc")
+        icon = KIND_ICON.get(kind, "◉")
+
+        predecessors = list(self.graph.predecessors(node))
+        successors   = list(self.graph.successors(node))
+
+        # Detect circular edges involving this node
+        circular_partners: set[str] = set()
+        for u, v, d in self.graph.edges(data=True):
+            if d.get("circular") and (u == node or v == node):
+                circular_partners.add(v if u == node else u)
+
+        # ── Center node panel ─────────────────────────────────────────
+        center_text = Text(justify="center")
+        center_text.append(f"\n{icon}\n", style=f"bold {color}")
+        center_text.append(f"{node}\n", style=f"bold {color}")
+        center_text.append(f"\n{KIND_LABEL.get(kind, kind)}", style="dim #666688")
+        center_text.append(f"\n\n← {len(predecessors)}   {len(successors)} →", style="#444466")
+        if circular_partners:
+            center_text.append(f"\n⚠ {len(circular_partners)} circular", style="bold red")
+
+        center_panel = Panel(
+            Align.center(center_text, vertical="middle"),
+            border_style=color,
+            box=ROUNDED,
+            expand=True,
         )
-        self._raw_layout = {n: (float(x), float(y)) for n, (x, y) in raw.items()}
 
-    def _to_screen(self, node: str, w: int, h: int) -> tuple[int, int]:
-        x, y = self._raw_layout.get(node, (0.0, 0.0))
-        margin_x, margin_y = 3, 2
-        col = int((x + 1) / 2 * (w - margin_x * 2)) + margin_x
-        row = int((y + 1) / 2 * (h - margin_y * 2)) + margin_y
-        return col, row
+        # ── Predecessors column ───────────────────────────────────────
+        pred_rows = self._build_neighbor_column(
+            predecessors, circular_partners, arrow="→", title="imported by"
+        )
 
-    def _bresenham(
-        self, x0: int, y0: int, x1: int, y1: int
-    ) -> list[tuple[int, int]]:
-        """Return integer (col, row) points along the line from (x0,y0) to (x1,y1)."""
-        points: list[tuple[int, int]] = []
-        dx, dy = abs(x1 - x0), abs(y1 - y0)
-        sx = 1 if x1 >= x0 else -1
-        sy = 1 if y1 >= y0 else -1
-        err = dx - dy
-        x, y = x0, y0
-        while True:
-            points.append((x, y))
-            if x == x1 and y == y1:
-                break
-            e2 = 2 * err
-            if e2 > -dy:
-                err -= dy
-                x += sx
-            if e2 < dx:
-                err += dx
-                y += sy
-        return points
+        # ── Successors column ─────────────────────────────────────────
+        succ_rows = self._build_neighbor_column(
+            successors, circular_partners, arrow="←", title="imports"
+        )
 
-    def render(self) -> Text:
-        w, h = self.size
-        if w < 10 or h < 4:
-            return Text("resize terminal")
+        # ── 3-column table ────────────────────────────────────────────
+        table = Table.grid(expand=True, padding=(0, 1))
+        table.add_column(ratio=3, no_wrap=False)   # predecessors
+        table.add_column(ratio=2, no_wrap=False)   # center
+        table.add_column(ratio=3, no_wrap=False)   # successors
+        table.add_row(pred_rows, center_panel, succ_rows)
 
-        # 2-D character grid: (char, style_str)
-        grid: list[list[tuple[str, str]]] = [
-            [(" ", "") for _ in range(w)] for _ in range(h)
-        ]
+        return table
 
-        def set_cell(col: int, row: int, ch: str, style: str) -> None:
-            if 0 <= row < h and 0 <= col < w:
-                # Never overwrite a node cell with an edge cell
-                existing_ch, _ = grid[row][col]
-                if existing_ch == " " or not style:
-                    grid[row][col] = (ch, style)
+    def _build_neighbor_column(
+        self,
+        neighbors: list[str],
+        circular_partners: set[str],
+        arrow: str,
+        title: str,
+    ) -> Panel:
+        content = Text()
+        total = len(neighbors)
+        shown = neighbors[: self._MAX_NEIGHBORS]
 
-        def force_cell(col: int, row: int, ch: str, style: str) -> None:
-            if 0 <= row < h and 0 <= col < w:
-                grid[row][col] = (ch, style)
+        if not shown:
+            content.append(f"\n  (none)", style="dim #444466")
+        else:
+            for i, nb in enumerate(shown):
+                nb_data = self.graph.nodes.get(nb, {})
+                nb_kind  = nb_data.get("kind", "internal")
+                nb_color = KIND_COLOR.get(nb_kind, "#888")
+                nb_icon  = KIND_ICON.get(nb_kind, "·")
+                nb_label = nb_data.get("label", nb.split(".")[-1])
 
-        # ── Pre-compute selected node's neighbours ──────────────────────────
-        selected_neighbours: set[str] = set()
-        if self.selected_node:
-            selected_neighbours = set(self.graph.successors(self.selected_node)) | set(
-                self.graph.predecessors(self.selected_node)
-            )
+                is_circ = nb in circular_partners
+                connector = "⚠ " if is_circ else "  "
+                circ_style = "bold red" if is_circ else ""
 
-        # ── Draw edges ──────────────────────────────────────────────────────
-        for src, tgt, data in self.graph.edges(data=True):
-            if src not in self._raw_layout or tgt not in self._raw_layout:
-                continue
-            x0, y0 = self._to_screen(src, w, h)
-            x1, y1 = self._to_screen(tgt, w, h)
-
-            kind = data.get("kind", "import")
-            is_circular = data.get("circular", False)
-            key = "circular" if is_circular else kind
-
-            ch, base_style = EDGE_STYLES.get(key, EDGE_STYLES["import"])
-
-            # Highlight edge when connecting to/from selected node
-            highlighted = self.selected_node and (
-                src == self.selected_node or tgt == self.selected_node
-            )
-            if highlighted:
-                if is_circular:
-                    style = "bold #FF4444"
-                elif kind == "cloud":
-                    style = "#FF9900"
-                elif kind == "http":
-                    style = "#E84393"
+                content.append(f"\n")
+                if arrow == "→":
+                    content.append(f"  {connector}", circ_style)
+                    content.append(f"{nb_icon} ", f"{nb_color}")
+                    content.append(f"{nb_label[:22]}", f"{'bold ' if is_circ else ''}{nb_color}")
+                    content.append(f"  {arrow}", "#2a3a6a")
                 else:
-                    style = "#4F8EF7 dim"
-            else:
-                style = base_style
+                    content.append(f"  {arrow}  ", "#2a3a6a")
+                    content.append(f"{nb_icon} ", f"{nb_color}")
+                    content.append(f"{nb_label[:22]}", f"{'bold ' if is_circ else ''}{nb_color}")
+                    content.append(f"  {connector}", circ_style)
 
-            # Sample the line — skip endpoints (they belong to nodes)
-            points = self._bresenham(x0, y0, x1, y1)
-            for col, row in points[2:-2]:
-                set_cell(col, row, ch, style)
+            if total > self._MAX_NEIGHBORS:
+                content.append(f"\n  … +{total - self._MAX_NEIGHBORS} more", style="dim #444466")
 
-        # ── Draw nodes ──────────────────────────────────────────────────────
-        for node, data in self.graph.nodes(data=True):
-            if node not in self._raw_layout:
-                continue
-            col, row = self._to_screen(node, w, h)
-            kind = data.get("kind", "internal")
-            color = NODE_COLORS.get(kind, "#cccccc")
-            label = data.get("label", node.split(".")[-1])
-            icon = KIND_ICON.get(kind, "◉")
+        border_title = (
+            f"[dim]← [bold]{title}[/bold]  {total}[/dim]" if arrow == "→"
+            else f"[dim]{title}  [bold]{total}[/bold] →[/dim]"
+        )
+        return Panel(
+            content,
+            title=border_title,
+            border_style="#1e1e3a",
+            box=ROUNDED,
+            expand=True,
+        )
 
-            is_selected = node == self.selected_node
-            is_neighbour = node in selected_neighbours
-
-            # Clip label to avoid overflowing
-            max_label = 12
-            label = label[:max_label]
-            full = f"{icon} {label} "
-            half = len(full) // 2
-
-            if is_selected:
-                bg = "on #0f2050"
-                node_style = f"bold {color} {bg} underline"
-                # Draw selection box around the node
-                box_w = len(full) + 2
-                force_cell(col - half - 1, row - 1, "┌" + "─" * box_w + "┐", "#4F8EF7")
-                for c in range(col - half - 1, col - half + box_w + 1):
-                    force_cell(c, row - 1, "─", "#4F8EF7")
-                force_cell(col - half - 1, row - 1, "┌", "#4F8EF7")
-                force_cell(col - half + box_w, row - 1, "┐", "#4F8EF7")
-                force_cell(col - half - 1, row, "│", "#4F8EF7")
-                force_cell(col - half + box_w, row, "│", "#4F8EF7")
-                force_cell(col - half - 1, row + 1, "└", "#4F8EF7")
-                force_cell(col - half + box_w, row + 1, "┘", "#4F8EF7")
-                for c in range(col - half - 1, col - half + box_w + 1):
-                    force_cell(c, row + 1, "─", "#4F8EF7")
-                force_cell(col - half - 1, row + 1, "└", "#4F8EF7")
-                force_cell(col - half + box_w, row + 1, "┘", "#4F8EF7")
-            elif is_neighbour:
-                bg = "on #1a1a3a"
-                node_style = f"{color} {bg}"
-            else:
-                bg = "on #0d0d1f"
-                node_style = f"dim {color} {bg}"
-
-            for i, ch in enumerate(full):
-                force_cell(col - half + i, row, ch, node_style)
-
-        # ── Assemble Rich Text ───────────────────────────────────────────────
-        text = Text(no_wrap=True, overflow="crop")
-        for row_idx, row_data in enumerate(grid):
-            for ch, style in row_data:
-                if style:
-                    text.append(ch, style=Style.parse(style) if style else Style.null())
-                else:
-                    text.append(ch)
-            if row_idx < h - 1:
-                text.append("\n")
-
-        return text
-
-    # ── Keyboard navigation ──────────────────────────────────────────────────
+    # ── Keyboard navigation ───────────────────────────────────────────
 
     def on_key(self, event: events.Key) -> None:
-        if not self._node_order:
+        nodes = self._node_order
+        if not nodes:
             return
-
         if self.selected_node is None:
-            self.selected_node = self._node_order[0]
-            self.post_message(NodeSelected(self.selected_node, self.graph))
+            self.selected_node = nodes[0]
+            self.post_message(NodeSelected(nodes[0]))
             return
 
-        idx = (
-            self._node_order.index(self.selected_node)
-            if self.selected_node in self._node_order
-            else 0
-        )
+        try:
+            idx = nodes.index(self.selected_node)
+        except ValueError:
+            idx = 0
 
-        if event.key in ("right", "down", "tab", "j", "l", "n"):
-            new = self._node_order[(idx + 1) % len(self._node_order)]
-        elif event.key in ("left", "up", "shift+tab", "k", "h", "p"):
-            new = self._node_order[(idx - 1) % len(self._node_order)]
+        if event.key in ("tab", "down", "j", "n"):
+            new = nodes[(idx + 1) % len(nodes)]
+        elif event.key in ("shift+tab", "up", "k", "p"):
+            new = nodes[(idx - 1) % len(nodes)]
         else:
             return
 
         event.stop()
         self.selected_node = new
-        self.post_message(NodeSelected(new, self.graph))
+        self.post_message(NodeSelected(new))
 
-    def on_click(self, event: events.Click) -> None:
-        """Select the node nearest to where the user clicked."""
-        w, h = self.size
-        best_node: str | None = None
-        best_dist = float("inf")
-
-        for node in self._raw_layout:
-            col, row = self._to_screen(node, w, h)
-            dist = math.hypot(event.x - col, event.y - row)
-            if dist < best_dist:
-                best_dist = dist
-                best_node = node
-
-        if best_node and best_dist < 8:
-            self.selected_node = best_node
-            self.post_message(NodeSelected(best_node, self.graph))
-            self.focus()
+    def select(self, node: str) -> None:
+        self.selected_node = node
+        self.refresh()
 
 
-# ─── Custom messages ─────────────────────────────────────────────────────────
+# ─── Bottom detail bar ────────────────────────────────────────────────────────
 
-
-class NodeSelected(Message):
-    def __init__(self, node: str, graph: nx.DiGraph) -> None:
-        super().__init__()
-        self.node = node
-        self.graph = graph
-
-
-# ─── Sidebar node list ───────────────────────────────────────────────────────
-
-
-class NodeList(Widget):
+class DetailBar(Widget):
     DEFAULT_CSS = """
-    NodeList {
-        width: 26;
-        border: solid #1e1e3a;
-        background: #09091a;
-    }
-    NodeList .node-item {
-        padding: 0 1;
-        height: 1;
-    }
-    NodeList .node-item:hover {
-        background: #1a1a3a;
-    }
-    NodeList Label {
-        padding: 0 1;
-        color: #666688;
-    }
-    """
-
-    def __init__(self, graph: nx.DiGraph, canvas: GraphCanvas, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self.graph = graph
-        self.canvas = canvas
-
-    def compose(self) -> ComposeResult:
-        yield Label(f" {self.graph.number_of_nodes()} nodes  {self.graph.number_of_edges()} edges")
-        yield Label("─" * 24)
-        for node, data in sorted(self.graph.nodes(data=True), key=lambda x: x[0]):
-            kind = data.get("kind", "internal")
-            color = NODE_COLORS.get(kind, "#cccccc")
-            icon = KIND_ICON.get(kind, "◉")
-            label = data.get("label", node.split(".")[-1])
-            item = Static(
-                Text.assemble(
-                    (f"{icon} ", f"bold {color}"),
-                    (label[:18], f"{color}"),
-                ),
-                classes="node-item",
-            )
-            item.tooltip = node
-            item._node_id = node  # type: ignore[attr-defined]
-            yield item
-
-    def on_click(self, event: events.Click) -> None:
-        # Find which item was clicked
-        for child in self.query(".node-item"):
-            node_id = getattr(child, "_node_id", None)
-            if node_id and child.region.contains(event.screen_x, event.screen_y):
-                self.canvas.selected_node = node_id
-                self.canvas.post_message(NodeSelected(node_id, self.graph))
-                self.canvas.focus()
-                break
-
-
-# ─── Detail panel ────────────────────────────────────────────────────────────
-
-
-class DetailPanel(Widget):
-    DEFAULT_CSS = """
-    DetailPanel {
-        height: 6;
-        border: solid #1e1e3a;
-        background: #0a0a1a;
-        padding: 0 1;
+    DetailBar {
+        height: 3;
+        background: #0a0a1e;
+        border-top: solid #1e1e3a;
+        padding: 0 2;
     }
     """
 
     def compose(self) -> ComposeResult:
-        yield Static("Select a node with [bold cyan]Tab[/] or click to inspect it.", id="detail-content")
+        yield Static("", id="detail-text")
 
-    def show(self, node: str, graph: nx.DiGraph) -> None:
+    def update(self, node: str, graph: nx.DiGraph) -> None:
         data = graph.nodes.get(node, {})
-        kind = data.get("kind", "internal")
-        color = NODE_COLORS.get(kind, "#cccccc")
-        icon = KIND_ICON.get(kind, "◉")
+        kind  = data.get("kind", "internal")
+        color = KIND_COLOR.get(kind, "#888")
+        icon  = KIND_ICON.get(kind, "·")
 
-        successors = list(graph.successors(node))
-        predecessors = list(graph.predecessors(node))
-
-        # Check for circular deps
-        circular_edges = [
-            (u, v)
-            for u, v, d in graph.edges(data=True)
+        preds = list(graph.predecessors(node))
+        succs = list(graph.successors(node))
+        circs = [
+            (u, v) for u, v, d in graph.edges(data=True)
             if d.get("circular") and (u == node or v == node)
         ]
 
-        lines = Text()
-        lines.append(f"{icon} {node}\n", style=f"bold {color}")
-        lines.append(f"  kind: ", style="dim")
-        lines.append(f"{kind}\n", style=color)
-        lines.append(f"  imports ({len(successors)}): ", style="dim")
-        lines.append(", ".join(s.split(".")[-1] for s in successors[:6]) or "—", style="#4F8EF7")
-        if len(successors) > 6:
-            lines.append(f" +{len(successors)-6} more", style="dim")
-        lines.append("\n")
-        lines.append(f"  imported by ({len(predecessors)}): ", style="dim")
-        lines.append(", ".join(p.split(".")[-1] for p in predecessors[:6]) or "—", style="#a0a0cc")
-        if circular_edges:
-            lines.append("\n  ⚠ circular dep detected", style="bold red")
+        t = Text()
+        t.append(f" {icon} ", f"bold {color}")
+        t.append(node, f"bold {color}")
+        t.append("  ·  ", "dim #333355")
+        t.append(KIND_LABEL.get(kind, kind), f"dim {color}")
+        t.append("  ·  ", "dim #333355")
+        t.append("imported by ", "dim")
+        t.append(str(len(preds)), "bold #a0a0ff")
+        t.append("  imports ", "dim")
+        t.append(str(len(succs)), "bold #4F8EF7")
+        if circs:
+            t.append("  ·  ", "dim #333355")
+            t.append(f"⚠ {len(circs)} circular dep{'s' if len(circs)>1 else ''}", "bold red")
 
-        self.query_one("#detail-content", Static).update(lines)
-
-
-# ─── Main App ────────────────────────────────────────────────────────────────
+        self.query_one("#detail-text", Static).update(t)
 
 
-class SynapticApp(App[None]):
-    """Interactive TUI for synaptic dependency graphs."""
+# ─── Mini stats bar (top) ─────────────────────────────────────────────────────
 
-    CSS = """
-    Screen {
-        background: #0d0d1a;
-        layout: grid;
-        grid-size: 2 3;
-        grid-columns: 26 1fr;
-        grid-rows: auto 1fr auto;
-    }
-    #header-row {
-        column-span: 2;
+class StatsBar(Widget):
+    DEFAULT_CSS = """
+    StatsBar {
         height: 1;
         background: #111122;
-        color: #4F8EF7;
-        text-align: center;
         padding: 0 2;
+        dock: top;
     }
-    #node-list {
-        row-span: 1;
-        overflow-y: scroll;
+    """
+
+    def __init__(self, graph: nx.DiGraph, project: Path, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.graph = graph
+        self.project = project
+
+    def render(self) -> Text:
+        from synaptic import __version__
+        G = self.graph
+
+        internals = sum(1 for _, d in G.nodes(data=True) if d.get("kind") == "internal")
+        clouds    = sum(1 for _, d in G.nodes(data=True) if d.get("kind") in ("AWS","GCP","Azure"))
+        http_     = sum(1 for _, d in G.nodes(data=True) if d.get("kind") == "http")
+        circs     = sum(1 for *_, d in G.edges(data=True) if d.get("circular"))
+
+        t = Text(no_wrap=True, overflow="crop")
+        t.append("⬡ ", "bold #4F8EF7")
+        t.append("synaptic", "bold #4F8EF7")
+        t.append(f"  {self.project.name}", "#666688")
+        t.append("  ·  ", "dim #333355")
+        t.append(str(G.number_of_nodes()), "bold #4F8EF7")
+        t.append(" nodes  ", "dim #444466")
+        t.append(str(G.number_of_edges()), "bold #4F8EF7")
+        t.append(" edges  ", "dim #444466")
+        if clouds:
+            t.append(f"  ◈ {clouds} cloud", "#FF9900")
+        if http_:
+            t.append(f"  ◈ {http_} http", "#E84393")
+        if circs:
+            t.append(f"  ⚠ {circs} circular", "bold red")
+        t.append(f"  ·  v{__version__}", "dim #333355")
+        return t
+
+
+# ─── Main App ─────────────────────────────────────────────────────────────────
+
+class SynapticApp(App[None]):
+    CSS = """
+    Screen {
+        layout: vertical;
+        background: #0d0d1a;
     }
-    #canvas {
-        row-span: 1;
+    #body {
+        layout: horizontal;
+        height: 1fr;
     }
-    #detail {
-        column-span: 2;
+    #main {
+        layout: vertical;
+        height: 1fr;
     }
     """
 
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
-        Binding("tab", "next_node", "Next node", show=False),
-        Binding("shift+tab", "prev_node", "Prev node", show=False),
-        Binding("r", "reset_selection", "Reset"),
-        Binding("f", "focus_canvas", "Focus graph"),
+        Binding("q",         "quit",           "Quit"),
+        Binding("tab",       "next_node",       "Next",    show=False),
+        Binding("shift+tab", "prev_node",       "Prev",    show=False),
+        Binding("r",         "reset",           "Reset"),
+        Binding("g",         "focus_canvas",    "Graph"),
+        Binding("s",         "focus_search",    "Search"),
     ]
 
     def __init__(self, graph: nx.DiGraph, project: Path, **kwargs: Any) -> None:
@@ -466,55 +504,59 @@ class SynapticApp(App[None]):
         self.project = project
 
     def compose(self) -> ComposeResult:
-        from synaptic import __version__
+        from textual.containers import Horizontal, Vertical
 
-        n_nodes = self.graph.number_of_nodes()
-        n_edges = self.graph.number_of_edges()
+        canvas  = EgoCanvas(self.graph, id="canvas")
+        sidebar = NodeSidebar(self.graph, id="sidebar")
+        detail  = DetailBar(id="detail")
 
-        canvas = GraphCanvas(self.graph, id="canvas")
-        detail = DetailPanel(id="detail")
+        yield StatsBar(self.graph, self.project)
 
-        yield Static(
-            Text.assemble(
-                ("⬡ synaptic", "bold #4F8EF7"),
-                (f"  {self.project.name}", "#666688"),
-                (f"  ·  {n_nodes} nodes  {n_edges} edges", "dim #444466"),
-                (f"  ·  v{__version__}", "dim #333355"),
-            ),
-            id="header-row",
-        )
-        yield NodeList(self.graph, canvas, id="node-list")
-        yield canvas
-        yield detail
+        with Horizontal(id="body"):
+            yield sidebar
+            with Vertical(id="main"):
+                yield canvas
+                yield detail
+
         yield Footer()
 
+    # ── Event handlers ───────────────────────────────────────────────
+
     def on_node_selected(self, message: NodeSelected) -> None:
-        self.query_one("#detail", DetailPanel).show(message.node, message.graph)
+        canvas  = self.query_one("#canvas",  EgoCanvas)
+        sidebar = self.query_one("#sidebar", NodeSidebar)
+        detail  = self.query_one("#detail",  DetailBar)
+
+        canvas.selected_node     = message.node
+        sidebar.selected_node    = message.node
+        detail.update(message.node, self.graph)
+
+    # ── Actions ──────────────────────────────────────────────────────
 
     def action_next_node(self) -> None:
-        self.query_one("#canvas", GraphCanvas).on_key(
+        self.query_one("#canvas", EgoCanvas).on_key(
             events.Key(self, "tab", character=None)
         )
 
     def action_prev_node(self) -> None:
-        self.query_one("#canvas", GraphCanvas).on_key(
+        self.query_one("#canvas", EgoCanvas).on_key(
             events.Key(self, "shift+tab", character=None)
         )
 
-    def action_reset_selection(self) -> None:
-        canvas = self.query_one("#canvas", GraphCanvas)
-        canvas.selected_node = None
-        self.query_one("#detail", DetailPanel).query_one(
-            "#detail-content", Static
-        ).update("Select a node with [bold cyan]Tab[/] or click to inspect it.")
+    def action_reset(self) -> None:
+        canvas  = self.query_one("#canvas",  EgoCanvas)
+        sidebar = self.query_one("#sidebar", NodeSidebar)
+        canvas.selected_node  = None
+        sidebar.selected_node = None
 
     def action_focus_canvas(self) -> None:
-        self.query_one("#canvas", GraphCanvas).focus()
+        self.query_one("#canvas", EgoCanvas).focus()
+
+    def action_focus_search(self) -> None:
+        self.query_one("#search-input", Input).focus()
 
 
-# ─── Entry point ─────────────────────────────────────────────────────────────
-
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 def launch(graph: nx.DiGraph, project: Path) -> None:
-    """Start the TUI application."""
     SynapticApp(graph=graph, project=project).run()
