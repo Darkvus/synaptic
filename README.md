@@ -2,11 +2,12 @@
 
 <img src="assets/demo.svg" alt="synaptic demo" width="100%"/>
 
-# synaptic
+# synaptic-graph
 
 **Visualize the dependency graph of any Python project.**  
 Internal imports · Cloud SDKs · HTTP clients · Circular deps — all in one command.
 
+[![PyPI](https://img.shields.io/pypi/v/synaptic-graph?style=flat-square&color=4F8EF7)](https://pypi.org/project/synaptic-graph/)
 [![Python](https://img.shields.io/badge/python-3.10%2B-4F8EF7?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![License](https://img.shields.io/badge/license-MIT-2ecc71?style=flat-square)](LICENSE)
 [![Built with Typer](https://img.shields.io/badge/CLI-Typer-E84393?style=flat-square)](https://typer.tiangolo.com)
@@ -31,15 +32,7 @@ Internal imports · Cloud SDKs · HTTP clients · Circular deps — all in one c
 ## Installation
 
 ```bash
-pip install synaptic
-```
-
-Or from source:
-
-```bash
-git clone https://github.com/your-username/synaptic
-cd synaptic
-pip install -e .
+pip install synaptic-graph
 ```
 
 > **Requirements:** Python 3.10+, `graphviz` binary installed on your system (`apt install graphviz` / `brew install graphviz`).
@@ -101,14 +94,20 @@ synaptic/
 
 | Color | Meaning |
 |---|---|
-| 🔵 Blue | Internal project module |
-| 🟠 Orange | AWS / GCP / Azure SDK |
-| 🩷 Pink | HTTP client (requests, httpx…) |
-| ⚫ Grey | Stdlib / external package |
-| 🔴 Red edge | Circular dependency |
+| Blue | Internal project module |
+| Orange | AWS / GCP / Azure SDK |
+| Pink | HTTP client (requests, httpx…) |
+| Grey | Stdlib / external package |
+| Red edge | Circular dependency |
+
+---
+
+## Contributing
+
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ---
 
 ## License
 
-MIT © 2024
+MIT © 2024 — see [LICENSE](LICENSE) for details.
